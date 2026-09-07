@@ -15,7 +15,16 @@ from app.models.diet import DietLog, DietLogItem
 from app.models.exercise import ExerciseLog, MuscleGroupEnum
 from app.models.rag import AIGenerationTrace
 from app.models.user import UserProfile
-from app.services.ai_service import AIService
+from app.services.ai_service import (
+    DIET_RECOMMEND_SCHEMA_VERSION,
+    EXERCISE_RECOMMEND_SCHEMA_VERSION,
+    AIInvocationResult,
+    AIService,
+    AIServiceError,
+)
+from app.services.ai_trace_service import AIGenerationAttemptRecorder
+from app.services.ai_quota_service import AIQuotaError, AIQuotaService
+from app.services.rag_prompt_context import build_rag_prompt_context
 from app.services.rag_service import RAGService
 
 
@@ -34,12 +43,20 @@ class RecommendationService:
         "maintain": "유지",
     }
 
-    def __init__(self, db: AsyncSession, ai_service: AIService, rag_service: RAGService) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        ai_service: AIService,
+        rag_service: RAGService,
+        quota_service: AIQuotaService,
+    ) -> None:
         self.db = db
         self.ai_service = ai_service
         self.rag_service = rag_service
+        self.quota_service = quota_service
 
     async def recommend_diet(self, user_id: int, target_date: date) -> dict:
+        pipeline_started = time.perf_counter()
         profile = await self._get_profile(user_id)
         goal = profile.goal.value
         goal_description = self.GOAL_DESCRIPTION_MAP.get(goal, goal)
@@ -80,25 +97,103 @@ class RecommendationService:
         }
 
         trace_group_id = str(uuid4())
+        rag_query = self._build_diet_rag_query(goal_description, remaining, user_context)
+        input_context_hash = self._hash_text(
+            str({"context": user_context, "query": rag_query})
+        )
+        generation_trace = await self.ai_service.start_generation_trace(
+            self.db,
+            user_id=user_id,
+            request_type="diet",
+            prompt_version=DIET_RECOMMEND_SCHEMA_VERSION,
+            rag_trace_group_id=trace_group_id,
+            input_context_hash=input_context_hash,
+            trace_metadata={"retrieval_category": "nutrition"},
+        )
+        await self._reserve_generation_quota(generation_trace)
+        attempt_recorder = AIGenerationAttemptRecorder(
+            self.db,
+            generation_trace.id,
+            self.quota_service,
+        )
+        retrieval_started = time.perf_counter()
         documents = await self.rag_service.search(
-            f"{goal_description} 식단 추천",
+            rag_query,
             category="nutrition",
             top_k=3,
             user_id=user_id,
             request_type="diet",
             trace_group_id=trace_group_id,
         )
-        rag_context = self._build_rag_context(documents)
+        pipeline_metadata = self._retrieval_metadata(
+            documents,
+            int((time.perf_counter() - retrieval_started) * 1000),
+        )
+        if not documents:
+            error = self._rag_unavailable_error(DIET_RECOMMEND_SCHEMA_VERSION)
+            pipeline_metadata["pre_persistence_pipeline_latency_ms"] = int(
+                (time.perf_counter() - pipeline_started) * 1000
+            )
+            await self._record_failed_generation(
+                user_id=user_id,
+                request_type="diet",
+                prompt_version=DIET_RECOMMEND_SCHEMA_VERSION,
+                trace_group_id=trace_group_id,
+                generation_trace_id=generation_trace.id,
+                input_context_hash=input_context_hash,
+                error=error,
+                trace_metadata=pipeline_metadata,
+            )
+            raise error
 
-        started = time.perf_counter()
-        ai_result = await self.ai_service.recommend_diet(user_context, rag_context)
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        recommendation_text = str(ai_result.get("recommendation", ""))
-        suggested_foods = ai_result.get("suggested_foods")
-        if not isinstance(suggested_foods, list):
-            suggested_foods = []
+        context_started = time.perf_counter()
+        prompt_context = build_rag_prompt_context(documents)
+        pipeline_metadata["prompt_context_build_latency_ms"] = int(
+            (time.perf_counter() - context_started) * 1000
+        )
+        generation_started = time.perf_counter()
+        try:
+            invocation = await self.ai_service.recommend_diet(
+                user_context,
+                prompt_context.text,
+                allowed_source_refs=prompt_context.allowed_refs,
+                attempt_recorder=attempt_recorder,
+            )
+        except AIServiceError as error:
+            pipeline_metadata["generation_call_latency_ms"] = int(
+                (time.perf_counter() - generation_started) * 1000
+            )
+            pipeline_metadata["pre_persistence_pipeline_latency_ms"] = int(
+                (time.perf_counter() - pipeline_started) * 1000
+            )
+            await self._record_failed_generation(
+                user_id=user_id,
+                request_type="diet",
+                prompt_version=DIET_RECOMMEND_SCHEMA_VERSION,
+                trace_group_id=trace_group_id,
+                generation_trace_id=generation_trace.id,
+                input_context_hash=input_context_hash,
+                error=error,
+                trace_metadata=pipeline_metadata,
+            )
+            raise
+        pipeline_metadata["generation_call_latency_ms"] = int(
+            (time.perf_counter() - generation_started) * 1000
+        )
 
-        sources = [str(document.get("title", "")) for document in documents if document.get("title")]
+        recommendation_text = prompt_context.resolve_reference_markers(
+            str(invocation.payload["recommendation"])
+        )
+        suggested_foods = list(invocation.payload["suggested_foods"])
+        source_refs = [str(ref) for ref in invocation.payload["source_refs"]]
+        sources = prompt_context.verified_titles(source_refs)
+        await self.rag_service.mark_traces_used_in_response(
+            trace_group_id,
+            prompt_context.selected_chunk_ids(source_refs),
+        )
+        pipeline_metadata["pre_persistence_pipeline_latency_ms"] = int(
+            (time.perf_counter() - pipeline_started) * 1000
+        )
         await self._save_recommendation(
             user_id=user_id,
             recommendation_type=RecommendationTypeEnum.DIET,
@@ -107,11 +202,14 @@ class RecommendationService:
             rag_sources=sources,
             prompt_used=None,
             request_type="diet",
-            prompt_version="diet_recommend_v1",
+            prompt_version=DIET_RECOMMEND_SCHEMA_VERSION,
             trace_group_id=trace_group_id,
-            input_context_hash=self._hash_text(str(user_context)),
+            generation_trace_id=generation_trace.id,
+            input_context_hash=input_context_hash,
             output_hash=self._hash_text(recommendation_text),
-            latency_ms=latency_ms,
+            invocation=invocation,
+            source_refs=source_refs,
+            trace_metadata=pipeline_metadata,
         )
 
         return {
@@ -122,6 +220,7 @@ class RecommendationService:
         }
 
     async def recommend_exercise(self, user_id: int, muscle_group: str | None) -> dict:
+        pipeline_started = time.perf_counter()
         profile = await self._get_profile(user_id)
         goal = profile.goal.value
         goal_description = self.GOAL_DESCRIPTION_MAP.get(goal, goal)
@@ -141,16 +240,7 @@ class RecommendationService:
         )
 
         trace_group_id = str(uuid4())
-        documents = await self.rag_service.search(
-            f"{goal_description} {selected_muscle_group} 운동 추천",
-            category="exercise",
-            top_k=3,
-            user_id=user_id,
-            request_type="exercise",
-            trace_group_id=trace_group_id,
-        )
-        rag_context = self._build_rag_context(documents)
-
+        rag_query = self._build_exercise_rag_query(goal_description, selected_muscle_group, recent_logs)
         exercise_history = self._build_exercise_history(recent_logs)
         user_context = {
             "goal": goal,
@@ -158,16 +248,103 @@ class RecommendationService:
             "muscle_group": selected_muscle_group,
             "exercise_history": exercise_history,
         }
+        input_context_hash = self._hash_text(
+            str({"context": user_context, "query": rag_query})
+        )
+        generation_trace = await self.ai_service.start_generation_trace(
+            self.db,
+            user_id=user_id,
+            request_type="exercise",
+            prompt_version=EXERCISE_RECOMMEND_SCHEMA_VERSION,
+            rag_trace_group_id=trace_group_id,
+            input_context_hash=input_context_hash,
+            trace_metadata={"retrieval_category": "exercise"},
+        )
+        await self._reserve_generation_quota(generation_trace)
+        attempt_recorder = AIGenerationAttemptRecorder(
+            self.db,
+            generation_trace.id,
+            self.quota_service,
+        )
+        retrieval_started = time.perf_counter()
+        documents = await self.rag_service.search(
+            rag_query,
+            category="exercise",
+            top_k=3,
+            user_id=user_id,
+            request_type="exercise",
+            trace_group_id=trace_group_id,
+        )
+        pipeline_metadata = self._retrieval_metadata(
+            documents,
+            int((time.perf_counter() - retrieval_started) * 1000),
+        )
 
-        started = time.perf_counter()
-        ai_result = await self.ai_service.recommend_exercise(user_context, rag_context)
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        recommendation_text = str(ai_result.get("recommendation", ""))
-        suggested_exercises = ai_result.get("suggested_exercises")
-        if not isinstance(suggested_exercises, list):
-            suggested_exercises = []
+        if not documents:
+            error = self._rag_unavailable_error(EXERCISE_RECOMMEND_SCHEMA_VERSION)
+            pipeline_metadata["pre_persistence_pipeline_latency_ms"] = int(
+                (time.perf_counter() - pipeline_started) * 1000
+            )
+            await self._record_failed_generation(
+                user_id=user_id,
+                request_type="exercise",
+                prompt_version=EXERCISE_RECOMMEND_SCHEMA_VERSION,
+                trace_group_id=trace_group_id,
+                generation_trace_id=generation_trace.id,
+                input_context_hash=input_context_hash,
+                error=error,
+                trace_metadata=pipeline_metadata,
+            )
+            raise error
 
-        sources = [str(document.get("title", "")) for document in documents if document.get("title")]
+        context_started = time.perf_counter()
+        prompt_context = build_rag_prompt_context(documents)
+        pipeline_metadata["prompt_context_build_latency_ms"] = int(
+            (time.perf_counter() - context_started) * 1000
+        )
+        generation_started = time.perf_counter()
+        try:
+            invocation = await self.ai_service.recommend_exercise(
+                user_context,
+                prompt_context.text,
+                allowed_source_refs=prompt_context.allowed_refs,
+                attempt_recorder=attempt_recorder,
+            )
+        except AIServiceError as error:
+            pipeline_metadata["generation_call_latency_ms"] = int(
+                (time.perf_counter() - generation_started) * 1000
+            )
+            pipeline_metadata["pre_persistence_pipeline_latency_ms"] = int(
+                (time.perf_counter() - pipeline_started) * 1000
+            )
+            await self._record_failed_generation(
+                user_id=user_id,
+                request_type="exercise",
+                prompt_version=EXERCISE_RECOMMEND_SCHEMA_VERSION,
+                trace_group_id=trace_group_id,
+                generation_trace_id=generation_trace.id,
+                input_context_hash=input_context_hash,
+                error=error,
+                trace_metadata=pipeline_metadata,
+            )
+            raise
+        pipeline_metadata["generation_call_latency_ms"] = int(
+            (time.perf_counter() - generation_started) * 1000
+        )
+
+        recommendation_text = prompt_context.resolve_reference_markers(
+            str(invocation.payload["recommendation"])
+        )
+        suggested_exercises = list(invocation.payload["suggested_exercises"])
+        source_refs = [str(ref) for ref in invocation.payload["source_refs"]]
+        sources = prompt_context.verified_titles(source_refs)
+        await self.rag_service.mark_traces_used_in_response(
+            trace_group_id,
+            prompt_context.selected_chunk_ids(source_refs),
+        )
+        pipeline_metadata["pre_persistence_pipeline_latency_ms"] = int(
+            (time.perf_counter() - pipeline_started) * 1000
+        )
         await self._save_recommendation(
             user_id=user_id,
             recommendation_type=RecommendationTypeEnum.EXERCISE,
@@ -176,11 +353,14 @@ class RecommendationService:
             rag_sources=sources,
             prompt_used=None,
             request_type="exercise",
-            prompt_version="exercise_recommend_v1",
+            prompt_version=EXERCISE_RECOMMEND_SCHEMA_VERSION,
             trace_group_id=trace_group_id,
-            input_context_hash=self._hash_text(str(user_context)),
+            generation_trace_id=generation_trace.id,
+            input_context_hash=input_context_hash,
             output_hash=self._hash_text(recommendation_text),
-            latency_ms=latency_ms,
+            invocation=invocation,
+            source_refs=source_refs,
+            trace_metadata=pipeline_metadata,
         )
 
         return {
@@ -245,9 +425,12 @@ class RecommendationService:
         request_type: str,
         prompt_version: str,
         trace_group_id: str | None,
+        generation_trace_id: int,
         input_context_hash: str | None,
         output_hash: str | None,
-        latency_ms: int | None,
+        invocation: AIInvocationResult,
+        source_refs: list[str],
+        trace_metadata: dict[str, object],
     ) -> None:
         record = AIRecommendation(
             user_id=user_id,
@@ -256,35 +439,134 @@ class RecommendationService:
             prompt_used=prompt_used,
             recommendation=recommendation,
             rag_sources=rag_sources,
-            model_used=self.ai_service.settings.AI_DEFAULT_MODEL,
+            model_used=invocation.model,
         )
         try:
             self.db.add(record)
             await self.db.flush()
             await self.rag_service.mark_traces_request_id(trace_group_id, record.id)
-            self.db.add(
-                AIGenerationTrace(
-                    user_id=user_id,
-                    recommendation_id=record.id,
-                    request_type=request_type,
-                    prompt_version=prompt_version,
-                    model_used=self.ai_service.settings.AI_DEFAULT_MODEL,
-                    rag_trace_group_id=trace_group_id,
-                    input_context_hash=input_context_hash,
-                    output_hash=output_hash,
-                    latency_ms=latency_ms,
-                )
+            generation_trace = await self.db.get(
+                AIGenerationTrace,
+                generation_trace_id,
+            )
+            if generation_trace is None:
+                raise RuntimeError("generation trace disappeared before persistence")
+            self.ai_service.apply_generation_trace_result(
+                generation_trace,
+                user_id=user_id,
+                recommendation_id=record.id,
+                request_type=request_type,
+                prompt_version=prompt_version,
+                status="succeeded",
+                rag_trace_group_id=trace_group_id,
+                input_context_hash=input_context_hash,
+                output_hash=output_hash,
+                invocation=invocation,
+                trace_metadata={
+                    **trace_metadata,
+                    "selected_source_refs": source_refs,
+                },
             )
             await self.db.commit()
         except Exception as exc:
             await self.db.rollback()
             raise RecommendationServiceError(500, "INTERNAL_ERROR", "추천 결과 저장에 실패했습니다") from exc
 
+    async def _record_failed_generation(
+        self,
+        *,
+        user_id: int,
+        request_type: str,
+        prompt_version: str,
+        trace_group_id: str,
+        generation_trace_id: int,
+        input_context_hash: str,
+        error: AIServiceError,
+        trace_metadata: dict[str, object] | None = None,
+    ) -> None:
+        await self.ai_service.complete_generation_trace(
+            self.db,
+            generation_trace_id,
+            quota_service=self.quota_service,
+            user_id=user_id,
+            request_type=request_type,
+            prompt_version=prompt_version,
+            status=error.trace_status,
+            rag_trace_group_id=trace_group_id,
+            input_context_hash=input_context_hash,
+            error=error,
+            provider_invoked=error.provider_invoked,
+            trace_metadata=trace_metadata,
+        )
+
+    async def _reserve_generation_quota(
+        self,
+        generation_trace: AIGenerationTrace,
+    ) -> None:
+        try:
+            await self.quota_service.reserve(self.db, generation_trace)
+        except AIQuotaError as exc:
+            raise AIServiceError(
+                exc.status_code,
+                exc.code,
+                exc.message,
+                stage=exc.stage,
+                provider_invoked=False,
+            ) from exc
+
     @staticmethod
-    def _build_rag_context(documents: list[dict]) -> str:
+    def _retrieval_metadata(documents: list[dict], retrieval_latency_ms: int) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "retrieval_latency_ms": retrieval_latency_ms,
+            "retrieved_document_count": len(documents),
+        }
         if not documents:
-            return "참고 자료 없음"
-        return "\n\n".join(f"[{doc['title']}]\n{doc['content']}" for doc in documents)
+            return metadata
+
+        first = documents[0]
+        key_map = {
+            "search_backend": "search_backend",
+            "search_mode": "search_mode",
+            "embedding_latency_ms": "retrieval_embedding_latency_ms",
+            "backend_search_latency_ms": "retrieval_backend_search_latency_ms",
+            "retrieval_core_latency_ms": "retrieval_core_latency_ms",
+        }
+        for source_key, target_key in key_map.items():
+            value = first.get(source_key)
+            if value is not None:
+                metadata[target_key] = value
+        return metadata
+
+    @staticmethod
+    def _rag_unavailable_error(schema_version: str) -> AIServiceError:
+        return AIServiceError(
+            503,
+            "RAG_CONTEXT_UNAVAILABLE",
+            "답변 근거를 찾지 못해 AI 요청을 처리할 수 없습니다",
+            stage="retrieval",
+            provider_invoked=False,
+            response_schema_version=schema_version,
+        )
+
+    @staticmethod
+    def _build_diet_rag_query(goal_description: str, remaining: dict, user_context: dict) -> str:
+        return (
+            f"{goal_description} 식단 추천 "
+            f"남은 칼로리 {remaining['calories']}kcal 단백질 {remaining['protein_g']}g "
+            f"탄수화물 {remaining['carbs_g']}g 지방 {remaining['fat_g']}g "
+            f"알레르기 {user_context['allergies']} 선호 {user_context['food_preferences']}"
+        )
+
+    @staticmethod
+    def _build_exercise_rag_query(
+        goal_description: str,
+        muscle_group: str,
+        recent_logs: list[ExerciseLog],
+    ) -> str:
+        recent_summary = ", ".join(
+            f"{log.exercise_name} {len(log.exercise_sets)}세트" for log in recent_logs
+        ) or "최근 기록 없음"
+        return f"{goal_description} {muscle_group} 운동 추천 최근 운동 {recent_summary}"
 
     @staticmethod
     def _hash_text(value: str) -> str:
