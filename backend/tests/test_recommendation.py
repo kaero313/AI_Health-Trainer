@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.services.recommendation_service import RecommendationServiceError
+from app.services.ai_service import AIServiceError
 
 MOCK_DIET_REC = {
     "remaining_nutrients": {
@@ -152,9 +153,17 @@ async def test_recommend_diet_rate_limited(
     auth_headers,
 ):
     _ = mock_rag_class
-    _ = mock_rec_class
     mock_ai = mock_ai_class.return_value
     mock_ai.check_rate_limit = AsyncMock(return_value=True)
+    mock_rec = mock_rec_class.return_value
+    mock_rec.recommend_diet = AsyncMock(
+        side_effect=AIServiceError(
+            429,
+            "DAILY_LIMIT_EXCEEDED",
+            "일일 AI 사용 한도에 도달했습니다",
+            stage="quota_admission",
+        )
+    )
 
     token, _ = await register_and_get_token(client, "diet-rec-rate-limit@example.com")
     response = await client.get("/api/v1/diet/recommend", headers=auth_headers(token))
