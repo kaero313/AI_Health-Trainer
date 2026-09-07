@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -35,6 +36,11 @@ from app.services.rag_pipeline import (
     split_over_max,
 )
 from app.services.rag_source_acquisition import FetchedUrlContent, RAGUrlFetcher
+from app.services.rag_trace_privacy import (
+    RetrievalQueryAudit,
+    build_retrieval_query_audit,
+    decision_query_context,
+)
 
 try:
     from google import genai
@@ -84,32 +90,74 @@ class RAGService:
         normalized_query = query.strip()
         if not normalized_query:
             return []
+        query_audit = build_retrieval_query_audit(
+            normalized_query,
+            settings=self.settings,
+            request_type=request_type,
+            category=category,
+        )
 
+        retrieval_started = time.perf_counter()
         safe_top_k = max(1, top_k)
         group_id = trace_group_id or str(uuid4())
-        query_embedding = await self.get_embedding(normalized_query)
-
+        embedding_started = time.perf_counter()
         try:
-            documents = await self._search_opensearch(normalized_query, query_embedding, category, safe_top_k)
-            search_backend = "opensearch"
-            search_mode = "hybrid"
-        except RAGIndexError as exc:
-            documents = await self._search_pgvector(normalized_query, query_embedding, category, safe_top_k)
-            search_backend = "pgvector_fallback"
-            search_mode = "vector"
+            query_embedding = await self.get_embedding(normalized_query)
+        except Exception as exc:
+            embedding_latency_ms = int((time.perf_counter() - embedding_started) * 1000)
+            opensearch_available = True
+            backend_search_started = time.perf_counter()
+            try:
+                documents = await self._search_opensearch_keyword(normalized_query, category, safe_top_k)
+            except RAGIndexError:
+                documents = []
+                opensearch_available = False
+            backend_search_latency_ms = int((time.perf_counter() - backend_search_started) * 1000)
+            retrieval_core_latency_ms = int((time.perf_counter() - retrieval_started) * 1000)
+            search_backend = "opensearch_keyword_fallback"
+            search_mode = "keyword"
             await self._save_pipeline_decision(
-                self.decision_policy.opensearch_fallback(
-                    query=normalized_query,
+                self.decision_policy.embedding_keyword_fallback(
+                    query_context=decision_query_context(query_audit),
                     category=category,
                     top_k=safe_top_k,
-                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    result_count=len(documents),
+                    opensearch_available=opensearch_available,
                 )
             )
+        else:
+            embedding_latency_ms = int((time.perf_counter() - embedding_started) * 1000)
+            backend_search_started = time.perf_counter()
+            try:
+                documents = await self._search_opensearch(normalized_query, query_embedding, category, safe_top_k)
+                search_backend = "opensearch"
+                search_mode = "hybrid"
+            except RAGIndexError as exc:
+                documents = await self._search_pgvector(normalized_query, query_embedding, category, safe_top_k)
+                search_backend = "pgvector_fallback"
+                search_mode = "vector"
+                backend_search_latency_ms = int((time.perf_counter() - backend_search_started) * 1000)
+                retrieval_core_latency_ms = int((time.perf_counter() - retrieval_started) * 1000)
+                await self._save_pipeline_decision(
+                    self.decision_policy.opensearch_fallback(
+                        query_context=decision_query_context(query_audit),
+                        category=category,
+                        top_k=safe_top_k,
+                        error_type=type(exc).__name__,
+                    )
+                )
+            else:
+                backend_search_latency_ms = int((time.perf_counter() - backend_search_started) * 1000)
+                retrieval_core_latency_ms = int((time.perf_counter() - retrieval_started) * 1000)
 
         for document in documents:
             document["rag_trace_group_id"] = group_id
             document["search_backend"] = search_backend
             document["search_mode"] = search_mode
+            document["embedding_latency_ms"] = embedding_latency_ms
+            document["backend_search_latency_ms"] = backend_search_latency_ms
+            document["retrieval_core_latency_ms"] = retrieval_core_latency_ms
 
         if user_id is not None:
             await self._save_retrieval_traces(
@@ -118,7 +166,7 @@ class RAGService:
                 request_type=request_type,
                 request_id=request_id,
                 trace_group_id=group_id,
-                query_text=normalized_query,
+                query_audit=query_audit,
                 category=category,
                 top_k=safe_top_k,
                 search_backend=search_backend,
@@ -480,6 +528,28 @@ class RAGService:
             .where(RagRetrievalTrace.rag_trace_group_id == trace_group_id)
             .values(request_id=request_id)
         )
+
+    async def mark_traces_used_in_response(
+        self,
+        trace_group_id: str | None,
+        chunk_ids: list[int],
+    ) -> None:
+        if not trace_group_id:
+            return
+        await self.db.execute(
+            update(RagRetrievalTrace)
+            .where(RagRetrievalTrace.rag_trace_group_id == trace_group_id)
+            .values(used_in_response=False)
+        )
+        if chunk_ids:
+            await self.db.execute(
+                update(RagRetrievalTrace)
+                .where(
+                    RagRetrievalTrace.rag_trace_group_id == trace_group_id,
+                    RagRetrievalTrace.chunk_id.in_(chunk_ids),
+                )
+                .values(used_in_response=True)
+            )
 
     def _parse_fetched_url(
         self,
@@ -977,6 +1047,51 @@ class RAGService:
             )
         return documents
 
+    async def _search_opensearch_keyword(
+        self,
+        query: str,
+        category: str | None,
+        top_k: int,
+    ) -> list[dict]:
+        hits = await self.index_service.keyword_search(query, category, max(top_k * 3, top_k))
+        ranked_hits: list[dict] = []
+        for rank, hit in enumerate(hits[:top_k], start=1):
+            source = hit.get("_source") or {}
+            chunk_id = str(source.get("chunk_id") or hit.get("_id") or "")
+            if not chunk_id.isdigit():
+                continue
+            ranked_hits.append(
+                {
+                    "chunk_id": chunk_id,
+                    "score": float(hit.get("_score") or 0.0),
+                    "keyword_score": float(hit.get("_score") or 0.0),
+                    "rank": rank,
+                }
+            )
+
+        chunk_rows = await self._load_active_chunks([int(hit["chunk_id"]) for hit in ranked_hits])
+        documents: list[dict] = []
+        for hit in ranked_hits:
+            chunk_id = int(hit["chunk_id"])
+            row = chunk_rows.get(chunk_id)
+            if row is None:
+                continue
+            chunk, source = row
+            documents.append(
+                self._build_document(
+                    chunk,
+                    source,
+                    rank=int(hit["rank"]),
+                    score=hit["score"],
+                    similarity=None,
+                    keyword_score=hit["keyword_score"],
+                    vector_score=None,
+                    index_name=self.settings.RAG_OPENSEARCH_ALIAS,
+                    index_version=self.settings.RAG_OPENSEARCH_INDEX,
+                )
+            )
+        return documents
+
     async def _search_pgvector(
         self,
         query: str,
@@ -1062,12 +1177,54 @@ class RAGService:
         request_type: str,
         request_id: int | None,
         trace_group_id: str,
-        query_text: str,
+        query_audit: RetrievalQueryAudit,
         category: str | None,
         top_k: int,
         search_backend: str,
         search_mode: str,
     ) -> None:
+        if not documents:
+            self.db.add(
+                RagRetrievalTrace(
+                    user_id=user_id,
+                    request_type=request_type,
+                    request_id=request_id,
+                    rag_trace_group_id=trace_group_id,
+                    query_text=None,
+                    query_hash=query_audit.query_hash,
+                    query_summary=query_audit.summary,
+                    query_policy_version=query_audit.policy_version,
+                    query_key_version=query_audit.key_version,
+                    query_retention_until=query_audit.retention_until,
+                    query_redacted_at=query_audit.redacted_at,
+                    category_filter=category,
+                    search_backend=search_backend,
+                    search_mode=search_mode,
+                    index_name=(
+                        self.settings.RAG_OPENSEARCH_ALIAS
+                        if search_backend.startswith("opensearch")
+                        else None
+                    ),
+                    index_version=(
+                        self.settings.RAG_OPENSEARCH_INDEX
+                        if search_backend.startswith("opensearch")
+                        else None
+                    ),
+                    top_k=top_k,
+                    chunk_id=None,
+                    source_id=None,
+                    rank=0,
+                    score=None,
+                    similarity=None,
+                    keyword_score=None,
+                    vector_score=None,
+                    used_in_prompt=False,
+                    used_in_response=False,
+                    embedding_model=(
+                        self._embedding_model_name() if search_mode != "keyword" else None
+                    ),
+                )
+            )
         for idx, document in enumerate(documents, start=1):
             self.db.add(
                 RagRetrievalTrace(
@@ -1075,7 +1232,13 @@ class RAGService:
                     request_type=request_type,
                     request_id=request_id,
                     rag_trace_group_id=trace_group_id,
-                    query_text=query_text,
+                    query_text=None,
+                    query_hash=query_audit.query_hash,
+                    query_summary=query_audit.summary,
+                    query_policy_version=query_audit.policy_version,
+                    query_key_version=query_audit.key_version,
+                    query_retention_until=query_audit.retention_until,
+                    query_redacted_at=query_audit.redacted_at,
                     category_filter=category,
                     search_backend=search_backend,
                     search_mode=search_mode,
@@ -1090,7 +1253,7 @@ class RAGService:
                     keyword_score=document.get("keyword_score"),
                     vector_score=document.get("vector_score"),
                     used_in_prompt=True,
-                    embedding_model=self._embedding_model_name(),
+                    embedding_model=self._embedding_model_name() if search_mode != "keyword" else None,
                 )
             )
         await self.db.commit()
