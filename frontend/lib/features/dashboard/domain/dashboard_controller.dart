@@ -2,44 +2,36 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../data/dashboard_repository.dart';
 
-final todayDashboardProvider = FutureProvider.autoDispose<Map<String, dynamic>>((
-  Ref ref,
-) {
-  return ref.read(dashboardRepositoryProvider).getToday();
-});
+final todayDashboardProvider = FutureProvider.autoDispose<Map<String, dynamic>>(
+  (Ref ref) {
+    return ref.read(dashboardRepositoryProvider).getToday();
+  },
+);
 
-final weeklyDashboardProvider = FutureProvider.autoDispose<Map<String, dynamic>>((
-  Ref ref,
-) {
-  return ref.read(dashboardRepositoryProvider).getWeekly();
-});
-
-final monthlyDashboardProvider =
-    FutureProvider.autoDispose.family<Map<String, dynamic>, String>((
-      Ref ref,
-      String monthKey,
-    ) {
-      final ({int year, int month}) resolvedMonth = _parseMonthKey(monthKey);
-      return ref.read(dashboardRepositoryProvider).getMonthly(
-        year: resolvedMonth.year,
-        month: resolvedMonth.month,
-      );
+final weeklyDashboardProvider =
+    FutureProvider.autoDispose<Map<String, dynamic>>((Ref ref) {
+      return ref.read(dashboardRepositoryProvider).getWeekly();
     });
 
-final weightHistoryProvider =
-    FutureProvider.autoDispose.family<List<Map<String, dynamic>>, String>((
-      Ref ref,
-      String monthKey,
-    ) {
+final monthlyDashboardProvider = FutureProvider.autoDispose
+    .family<Map<String, dynamic>, String>((Ref ref, String monthKey) {
+      final ({int year, int month}) resolvedMonth = _parseMonthKey(monthKey);
+      return ref
+          .read(dashboardRepositoryProvider)
+          .getMonthly(year: resolvedMonth.year, month: resolvedMonth.month);
+    });
+
+final weightHistoryProvider = FutureProvider.autoDispose
+    .family<List<Map<String, dynamic>>, String>((Ref ref, String monthKey) {
       final ({int year, int month}) resolvedMonth = _parseMonthKey(monthKey);
       final int months = _resolveWeightHistoryMonths(
         DateTime.now(),
         resolvedMonth.year,
         resolvedMonth.month,
       );
-      return ref.read(dashboardRepositoryProvider).getWeightHistory(
-        months: months,
-      );
+      return ref
+          .read(dashboardRepositoryProvider)
+          .getWeightHistory(months: months);
     });
 
 void refreshDashboard(WidgetRef ref) {
