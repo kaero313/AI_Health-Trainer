@@ -20,7 +20,9 @@ class DashboardRepository {
 
   Future<Map<String, dynamic>> getToday() async {
     try {
-      final Response<dynamic> response = await dio.get<dynamic>('/dashboard/today');
+      final Response<dynamic> response = await dio.get<dynamic>(
+        '/dashboard/today',
+      );
       return _parseDashboardResponse(response.data);
     } on DioException catch (e) {
       throw DashboardRepositoryException(
@@ -32,7 +34,9 @@ class DashboardRepository {
 
   Future<Map<String, dynamic>> getWeekly() async {
     try {
-      final Response<dynamic> response = await dio.get<dynamic>('/dashboard/weekly');
+      final Response<dynamic> response = await dio.get<dynamic>(
+        '/dashboard/weekly',
+      );
       return _parseDashboardResponse(response.data);
     } on DioException catch (e) {
       throw DashboardRepositoryException(
@@ -113,16 +117,12 @@ class DashboardRepository {
 
     return rawData.map((dynamic item) {
       if (item is! Map<dynamic, dynamic>) {
-        throw const DashboardRepositoryException(
-          '대시보드 데이터가 비어 있습니다.',
-        );
+        throw const DashboardRepositoryException('대시보드 데이터가 비어 있습니다.');
       }
 
       return item.map<String, dynamic>(
-        (dynamic key, dynamic value) => MapEntry<String, dynamic>(
-          key.toString(),
-          value,
-        ),
+        (dynamic key, dynamic value) =>
+            MapEntry<String, dynamic>(key.toString(), value),
       );
     }).toList();
   }
